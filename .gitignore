@@ -1,2 +1,7 @@
 *.png
 *.webp
+
+
+# Added by cargo
+
+/target
