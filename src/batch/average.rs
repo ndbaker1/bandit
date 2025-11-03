@@ -37,19 +37,18 @@ pub struct GradientConsensus {}
 
 impl GradientGenerator for GradientConsensus {
     fn gradient(&self, images: &[DynamicImage]) -> crate::error::Result<GrayImage> {
-        if images.is_empty() {
-            return Err("No images provided".into());
-        }
-
         let gray_images: Vec<_> = crate::to_gray_images(images);
 
-        let (width, height) = gray_images[0].dimensions();
+        let (width, height) = gray_images
+            .first()
+            .ok_or("No images provided")?
+            .dimensions();
         let (width, height) = (width as usize, height as usize);
 
         let sum = Array2::<f32>::from_shape_fn((width, height), |(x, y)| {
             gray_images
                 .iter()
-                .map(|image| image.get_pixel(x as u32, y as u32)[0])
+                .map(|image| image.get_pixel(x as _, y as _)[0])
                 .map(f32::from)
                 .sum()
         });
@@ -57,7 +56,7 @@ impl GradientGenerator for GradientConsensus {
         let avg_array = sum.mapv(|x| x / gray_images.len() as f32);
 
         let gradient = GrayImage::from_fn(width as _, height as _, |x, y| {
-            Luma([avg_array[[x as usize, y as usize]] as u8])
+            Luma([avg_array[[x as _, y as _]] as u8])
         });
 
         Ok(gradient)
