@@ -1,4 +1,4 @@
-use bandit::{GradientGenerator, MaskGenerator, batch};
+use bandit::{MaskGenerator, batch};
 use clap::Parser;
 use std::{
     fs,
@@ -39,9 +39,9 @@ fn main() -> Result<()> {
     let images: Vec<_> = image_files
         .iter()
         .filter_map(|img_path| {
-            log::info!("Processing image: {:?}", img_path);
+            log::debug!("Processing image: {:?}", img_path);
             match image::open(img_path) {
-                Ok(image) => Some(image),
+                Ok(image) => Some(image.into_luma8()),
                 Err(e) => {
                     log::error!("Skipping image {:?} due to error: {}", img_path, e);
                     None
@@ -50,30 +50,39 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    for (name, generator) in Vec::from_iter([("average", batch::average::GradientConsensus {})]) {
-        let image = generator.gradient(&images)?;
-        let path = Path::new(&args.output_dir).join(format!("{}_gradient.png", name));
-        log::info!("Saving watermark gradient to {:?}", path);
-        image.save(path)?;
-    }
-
-    for (name, generator) in Vec::from_iter([
+    let generators: [(_, &dyn MaskGenerator); _] = [
         (
             "average",
-            &batch::average::MaskConsensus {
-                threshold_factor: 0.8,
-            } as &dyn MaskGenerator,
+            &batch::average::Threshold {
+                threshold_factor: 1.3,
+            },
         ),
         (
             "frequency",
-            &batch::frequency::MaskConsensus {} as &dyn MaskGenerator,
+            &batch::frequency::MaskConsensus {
+                high_pass_filter_radial_factor: 0.01,
+            },
         ),
-    ]) {
-        let image = generator.mask(&images)?;
+    ];
+
+    for (name, generator) in &generators {
         let path = Path::new(&args.output_dir).join(format!("{}_mask.png", name));
-        log::info!("Saving watermark gradient to {:?}", path);
-        image.save(path)?;
+        log::info!("Saving watermark mask to {:?}", path);
+        generator.mask(&images)?.save(path)?;
     }
+
+    let path = Path::new(&args.output_dir).join("combined_mask.png");
+    log::info!("Saving watermark mask to {:?}", path);
+    batch::average::Threshold {
+        threshold_factor: 2.5,
+    }
+    .mask(
+        &generators
+            .iter()
+            .filter_map(|(_, generator)| generator.mask(&images).ok())
+            .collect::<Vec<_>>(),
+    )?
+    .save(path)?;
 
     Ok(())
 }

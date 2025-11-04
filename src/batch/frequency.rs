@@ -1,4 +1,4 @@
-use image::{DynamicImage, GrayImage, ImageBuffer, Luma};
+use image::{GrayImage, Luma};
 use ndarray::{Array2, s};
 use rustfft::{
     FftPlanner,
@@ -7,105 +7,85 @@ use rustfft::{
 
 use crate::MaskGenerator;
 
-pub struct MaskConsensus {}
+pub struct MaskConsensus {
+    pub high_pass_filter_radial_factor: f64,
+}
 
 impl MaskGenerator for MaskConsensus {
-    fn mask(&self, images_2: &[DynamicImage]) -> crate::error::Result<GrayImage> {
-        if images_2.is_empty() {
-            return Err("No images provided".into());
-        }
+    fn mask(&self, images: &[GrayImage]) -> crate::error::Result<GrayImage> {
+        // take the first image to determine the dimensions of images in the set
+        //
+        // SAFETY: dimensions of all images in the list should be identical
+        let (width, height) = images.first().ok_or("No images provided")?.dimensions();
+        let (width, height) = (width as usize, height as usize);
 
-        let mut images: Vec<Array2<f64>> = Vec::new();
-        let gray_images: Vec<_> = crate::to_gray_images(images_2);
+        // convert all images to their 2d vector representation to make math operations simpler
+        let image_vecs: Vec<_> = images
+            .iter()
+            .map(|image| {
+                Array2::from_shape_fn((width, height), |(x, y)| {
+                    image.get_pixel(x as _, y as _)[0] as _
+                })
+            })
+            .collect();
 
-        for (i, gray_image) in gray_images.iter().enumerate() {
-            let (width, height) = gray_image.dimensions();
-            let img_array = Array2::from_shape_fn((height as usize, width as usize), |(r, c)| {
-                gray_image.get_pixel(c as u32, r as u32)[0] as f64
-            });
-
-            if let Some(first) = images.first() {
-                if (height as usize, width as usize) != first.dim() {
-                    log::warn!(
-                        "Image at index {:} has different dimensions ({}, {}). Skipping.",
-                        i,
-                        height,
-                        width
-                    );
-                    continue;
-                }
-            }
-
-            images.push(img_array);
-        }
-
-        if images.is_empty() {
-            return Err(
-                "No images were successfully processed or had consistent dimensions.".into(),
-            );
-        }
-
-        log::info!("Starting frequency-domain analysis");
-
-        let (rows, cols) = images[0].dim();
+        log::debug!("Starting frequency-domain analysis");
 
         let mut planner = FftPlanner::new();
-        let fft_forward = planner.plan_fft_forward(rows * cols);
-        let fft_inverse = planner.plan_fft_inverse(rows * cols);
+        let fft_forward = planner.plan_fft_forward(width * height);
+        let fft_inverse = planner.plan_fft_inverse(width * height);
 
-        let mut ffts: Vec<Array2<Complex<f64>>> = Vec::new();
-        for img_array in &images {
-            let mut buffer: Vec<Complex<f64>> =
-                img_array.iter().map(|&x| Complex::new(x, 0.0)).collect();
-            fft_forward.process(&mut buffer);
-            ffts.push(Array2::from_shape_vec((rows, cols), buffer)?);
-        }
-
-        let shifted_ffts: Vec<Array2<Complex<f64>>> = ffts
-            .into_iter()
-            .map(|fft_array| self.fft_shift(&fft_array))
+        let shifted_ffts: Vec<_> = image_vecs
+            .iter()
+            // convert all pixel values into complex coordinates because the fourier transform
+            // operates in the complex plane.
+            .map(|image| {
+                image
+                    .iter()
+                    .map(|&x| Complex::new(x, 0.0))
+                    .collect::<Vec<_>>()
+            })
+            // perform the forward FFT pass and collect the data in a 2d vector
+            // TODO: why?
+            .filter_map(|mut buffer| {
+                fft_forward.process(&mut buffer);
+                Array2::from_shape_vec((width, height), buffer).ok()
+            })
+            // perform a shift on the FFT vector
+            // TODO: why?
+            .map(|fft| self.fft_shift(&fft))
             .collect();
-        log::debug!(
-            "Shifted FFT[0] top-left corner (magnitude): {:?}",
-            &shifted_ffts[0].slice(s![0..5, 0..5]).map(|c| c.norm())
-        );
 
-        // Calculate the average magnitude spectrum
-        let mut avg_magnitude_spectrum = Array2::zeros((rows, cols));
-        for s_fft in &shifted_ffts {
-            avg_magnitude_spectrum = avg_magnitude_spectrum + s_fft.map(|c| c.abs().ln_1p());
-        }
-        avg_magnitude_spectrum = avg_magnitude_spectrum / shifted_ffts.len() as f64;
-        log::debug!(
-            "Average magnitude spectrum top-left corner: {:?}",
-            &avg_magnitude_spectrum.slice(s![0..5, 0..5])
-        );
+        log::debug!("Computing the Average Magnitude Spectrum");
 
-        // --- Noise Reduction using a High-Pass Filter ---
-        let crow = rows / 2;
-        let ccol = cols / 2;
-        let mut mask = Array2::ones((rows, cols));
-        let r = ((rows.min(cols) as f64) * 0.1) as usize;
+        // average magnitude spectrum
+        // TODO: why?
+        let avg_magnitude_spectrum = Array2::from_shape_fn((width, height), |(x, y)| {
+            shifted_ffts
+                .iter()
+                .map(|shifted_fft| shifted_fft[[x, y]])
+                .map(|c| c.abs().ln_1p())
+                .sum()
+        }) / shifted_ffts.len() as f64;
 
-        for i in (crow - r)..(crow + r) {
-            for j in (ccol - r)..(ccol + r) {
-                if i < rows && j < cols {
-                    mask[[i, j]] = 0.0;
-                }
+        log::debug!("Applying High-Pass filter");
+
+        let mask = Array2::from_shape_fn((width, height), |(x, y)| {
+            let crow = height / 2;
+            let ccol = width / 2;
+            let radius = (height.min(width) as f64 * self.high_pass_filter_radial_factor) as usize;
+
+            if x.abs_diff(ccol) < radius && y.abs_diff(crow) < radius {
+                0.0
+            } else {
+                1.0
             }
-        }
-        log::debug!(
-            "High-pass filter mask top-left corner: {:?}",
-            &mask.slice(s![0..5, 0..5])
-        );
+        });
 
-        let filtered_spectrum = &avg_magnitude_spectrum * &mask;
-        log::debug!(
-            "Filtered spectrum top-left corner: {:?}",
-            &filtered_spectrum.slice(s![0..5, 0..5])
-        );
+        let filtered_spectrum = avg_magnitude_spectrum * mask;
 
-        // --- Thresholding the Filtered Spectrum ---
+        log::debug!("Thresholding the Filtered Spectrum");
+
         let mut non_zero_values: Vec<f64> = filtered_spectrum
             .iter()
             .filter(|&&x| x > 0.0)
@@ -114,14 +94,17 @@ impl MaskGenerator for MaskConsensus {
         non_zero_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let threshold_index = (non_zero_values.len() as f64 * 0.95) as usize;
-        let threshold = *non_zero_values.get(threshold_index).unwrap_or(&0.0);
-        log::debug!("Threshold for watermark frequency mask: {}", threshold);
+        let threshold = *non_zero_values
+            .get(threshold_index)
+            .expect("spectrum is not empty");
+
+        log::debug!("Generating the Spatial Domain Mask");
 
         // --- Spatial Domain Mask Generation ---
-        let mut spatial_mask_sum = Array2::zeros((rows, cols));
+        let mut spatial_mask_sum = Array2::zeros((width, height));
         for (i, s_fft) in shifted_ffts.iter().enumerate() {
-            let image_filter = Array2::from_shape_fn((rows, cols), |(row, col)| {
-                let mask = match filtered_spectrum[[row, col]] > threshold {
+            let image_filter = Array2::from_shape_fn((width, height), |(x, y)| {
+                let mask = match filtered_spectrum[[x, y]] > threshold {
                     true => 0.,
                     false => 1.,
                 };
@@ -133,54 +116,41 @@ impl MaskGenerator for MaskConsensus {
 
             let mut buffer: Vec<Complex<f64>> = filtered_fft_unshifted.into_raw_vec();
             fft_inverse.process(&mut buffer);
-            let recon_image = Array2::from_shape_vec((rows, cols), buffer)? / (rows * cols) as f64;
-            log::debug!(
-                "Reconstructed image[{}].map(|c| c.norm()) top-left corner: {:?}",
-                i,
-                &recon_image.slice(s![0..5, 0..5]).map(|c| c.norm())
-            );
+            let recon_image =
+                Array2::from_shape_vec((width, height), buffer)? / (height * width) as f64;
 
-            let diff_image = images[i].clone() - recon_image.map(|c| c.norm());
-            log::debug!(
-                "Diff image[{}] top-left corner: {:?}",
-                i,
-                &diff_image.slice(s![0..5, 0..5])
-            );
+            let diff_image = image_vecs[i].clone() - recon_image.map(|c| c.norm());
             spatial_mask_sum = spatial_mask_sum + diff_image.map(|&x| x.abs());
         }
 
-        let avg_spatial_mask = spatial_mask_sum / images.len() as f64;
-        log::debug!(
-            "Average spatial mask top-left corner: {:?}",
-            &avg_spatial_mask.slice(s![0..5, 0..5])
-        );
+        log::debug!("Computing the Average Spatial Mask");
+
+        let avg_spatial_mask = spatial_mask_sum / image_vecs.len() as f64;
+
+        log::debug!("Thresholding the Average Spatial Mask");
 
         // Normalize and threshold the average spatial mask
-        let min_val = *avg_spatial_mask
+        let min = *avg_spatial_mask
             .iter()
-            .min_by(|&a: &&f64, &b: &&f64| a.partial_cmp(b).unwrap())
-            .unwrap_or(&0.0);
-        let max_val = *avg_spatial_mask
+            .min_by(double_cmp)
+            .expect("mask is not empty");
+        let max = *avg_spatial_mask
             .iter()
-            .max_by(|&a: &&f64, &b: &&f64| a.partial_cmp(b).unwrap())
-            .unwrap_or(&0.0);
+            .max_by(double_cmp)
+            .expect("mask is not empty");
 
-        let final_mask_array = if (max_val - min_val) < f64::EPSILON {
-            Array2::zeros((rows, cols))
-        } else {
-            (&avg_spatial_mask - min_val) / (max_val - min_val)
-        };
+        let mask_vec = (&avg_spatial_mask - min) / (max - min);
+        let mask_mean = mask_vec.mean().expect("mask is not empty");
+        let mask_std_dev = mask_vec.std(0.);
+        let threshold = mask_mean + mask_std_dev;
 
-        let mean_val = final_mask_array.mean().unwrap_or(0.);
-        let std_val = final_mask_array.std(0.);
-        let final_mask_array_thresholded =
-            final_mask_array.map(|&x| if x > mean_val + std_val { 255u8 } else { 0u8 });
-
-        let final_mask = ImageBuffer::from_fn(cols as u32, rows as u32, |x, y| {
-            Luma([final_mask_array_thresholded[[y as usize, x as usize]]])
+        let mask = GrayImage::from_fn(width as _, height as _, |x, y| {
+            let pixel = mask_vec[[x as _, y as _]];
+            let value = if pixel < threshold { 0 } else { u8::MAX };
+            Luma([value])
         });
 
-        Ok(final_mask)
+        Ok(mask)
     }
 }
 
@@ -258,4 +228,8 @@ impl MaskConsensus {
 
         output
     }
+}
+
+fn double_cmp(a: &&f64, b: &&f64) -> std::cmp::Ordering {
+    return a.partial_cmp(b).unwrap();
 }

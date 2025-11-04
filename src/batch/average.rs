@@ -1,64 +1,55 @@
-use std::u8;
-
-use image::{DynamicImage, GrayImage, Luma};
+use image::{GrayImage, Luma};
 use ndarray::Array2;
 
-use crate::{GradientGenerator, MaskGenerator};
+use crate::MaskGenerator;
 
-pub struct MaskConsensus {
-    pub threshold_factor: f32,
+pub struct Threshold {
+    pub threshold_factor: f64,
 }
 
-impl MaskGenerator for MaskConsensus {
-    fn mask(&self, images: &[DynamicImage]) -> crate::error::Result<GrayImage> {
-        let gradient = GradientConsensus {}.gradient(images)?;
-
-        let (width, height) = gradient.dimensions();
+impl MaskGenerator for Threshold {
+    fn mask(&self, images: &[GrayImage]) -> crate::error::Result<GrayImage> {
+        // take the first image to determine the dimensions of images in the set
+        //
+        // SAFETY: dimensions of all images in the list should be identical
+        let (width, height) = images.first().ok_or("No images provided")?.dimensions();
         let (width, height) = (width as usize, height as usize);
 
-        let sum = gradient.pixels().map(|a| a[0] as f32).sum::<f32>();
-        let mean = sum / (width * height) as f32;
-        let threshold = (mean * self.threshold_factor) as u8;
-        log::debug!("sum: {}, mean {}, threshold: {}", sum, mean, threshold);
+        log::debug!("Computing the Sum Mask");
 
-        let mask = GrayImage::from_fn(width as _, height as _, |x, y| {
-            let pixel_value = match gradient.get_pixel(x, y)[0] < threshold {
-                true => 0,
-                false => u8::MAX,
-            };
-            Luma([pixel_value])
-        });
-
-        Ok(mask)
-    }
-}
-
-pub struct GradientConsensus {}
-
-impl GradientGenerator for GradientConsensus {
-    fn gradient(&self, images: &[DynamicImage]) -> crate::error::Result<GrayImage> {
-        let gray_images: Vec<_> = crate::to_gray_images(images);
-
-        let (width, height) = gray_images
-            .first()
-            .ok_or("No images provided")?
-            .dimensions();
-        let (width, height) = (width as usize, height as usize);
-
-        let sum = Array2::<f32>::from_shape_fn((width, height), |(x, y)| {
-            gray_images
+        // computes the summation in pixel dimensions over all images
+        let sum_vec = Array2::<f64>::from_shape_fn((width, height), |(x, y)| {
+            images
                 .iter()
                 .map(|image| image.get_pixel(x as _, y as _)[0])
-                .map(f32::from)
+                .map(f64::from)
                 .sum()
         });
 
-        let avg_array = sum.mapv(|x| x / gray_images.len() as f32);
+        log::debug!("Computing the Mean Mask");
 
-        let gradient = GrayImage::from_fn(width as _, height as _, |x, y| {
-            Luma([avg_array[[x as _, y as _]] as u8])
+        // normalziaing the summation vector based on the number of images
+        let mean_vec = sum_vec / images.len() as f64;
+
+        log::debug!("Thresholding the Mask");
+
+        // sum all of the pixel values in the grayscale image
+        let sum = mean_vec.sum();
+        // compute the mean using the total number of pixels (also equal to the image area)
+        let mean = sum / mean_vec.len() as f64;
+        // apply the threshold factor to to mean to get the final value
+        let threshold = (mean * self.threshold_factor) as u8;
+
+        log::trace!("sum: {}, mean {}, threshold: {}", sum, mean, threshold);
+
+        // compute the mask by determining whether each pixel values in the grayscale image is
+        // above or below the threshold value.
+        let mask = GrayImage::from_fn(width as _, height as _, |x, y| {
+            let pixel = mean_vec[[x as _, y as _]] as u8;
+            let value = if pixel < threshold { 0 } else { u8::MAX };
+            Luma([value])
         });
 
-        Ok(gradient)
+        Ok(mask)
     }
 }
