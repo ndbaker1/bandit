@@ -19,7 +19,7 @@ pub struct BatchFFT {
     pub high_pass_filter_radial_coefficient: f64,
 
     /// the percentile factor to use for the spectral filtering
-    pub spectral_filter_percentile_coefficient: f64,
+    pub spectral_filter_percentile: f64,
 }
 
 impl MaskGenerator for BatchFFT {
@@ -68,11 +68,13 @@ impl MaskGenerator for BatchFFT {
         log::debug!("Computing the Median Magnitude Spectrum");
 
         let magnitude_spectrum_median_mat = Array2::from_shape_fn((width, height), |(x, y)| {
-            shifted_ffts
+            let median_candidates: Vec<_> = shifted_ffts
                 .iter()
                 .map(|shifted_fft| shifted_fft[[x, y]])
                 .map(|c| c.abs().ln_1p())
-                .sum()
+                .sorted_by(f64::total_cmp)
+                .collect();
+            median_candidates[median_candidates.len() / 2]
         }) / shifted_ffts.len() as f64;
 
         log::debug!("Applying High-Pass filter");
@@ -108,7 +110,7 @@ impl MaskGenerator for BatchFFT {
         let magnitude_spectrum_threshold = *magnitude_spectrum_threshold_candidates
             .get({
                 let upper_bound = magnitude_spectrum_threshold_candidates.len() as f64;
-                (self.spectral_filter_percentile_coefficient * upper_bound) as usize
+                (self.spectral_filter_percentile * upper_bound) as usize
             })
             .ok_or("index must not be out of bounds")?;
 

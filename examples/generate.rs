@@ -67,8 +67,8 @@ fn main() -> Result<()> {
         (
             "frequency",
             &batch::frequency::BatchFFT {
-                high_pass_filter_radial_coefficient: 0.3,
-                spectral_filter_percentile_coefficient: 0.6,
+                high_pass_filter_radial_coefficient: 0.15,
+                spectral_filter_percentile: 0.6,
             },
         ),
     ];
