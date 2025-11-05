@@ -246,5 +246,5 @@ impl FFT2 {
 }
 
 fn f64_cmp(a: &&f64, b: &&f64) -> std::cmp::Ordering {
-    return a.partial_cmp(b).unwrap();
+    a.partial_cmp(b).unwrap()
 }
