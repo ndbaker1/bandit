@@ -1,4 +1,5 @@
 use bandit::{MaskGenerator, batch};
+
 use clap::Parser;
 use std::{
     fs,
@@ -53,36 +54,39 @@ fn main() -> Result<()> {
     let generators: [(_, &dyn MaskGenerator); _] = [
         (
             "average",
-            &batch::average::Threshold {
-                threshold_factor: 1.3,
+            &batch::mean::Threshold {
+                threshold_factor: 1.0,
             },
         ),
         (
             "frequency",
-            &batch::frequency::MaskConsensus {
-                high_pass_filter_radial_factor: 0.01,
+            &batch::frequency::FFT2 {
+                high_pass_filter_radial_factor: 0.3,
+                spectral_filter_percentile_factor: 0.6,
             },
         ),
     ];
 
-    for (name, generator) in &generators {
-        let path = Path::new(&args.output_dir).join(format!("{}_mask.png", name));
-        log::info!("Saving watermark mask to {:?}", path);
-        generator.mask(&images)?.save(path)?;
-    }
+    // perform all mask generation types and collect their images
+    let image_masks = generators
+        .iter()
+        .filter_map(|(name, generator)| {
+            let mask = generator.mask(&images).ok()?;
+            let path = Path::new(&args.output_dir).join(format!("{}_mask.png", name));
+            mask.save(&path).ok()?;
+            log::info!("Saved watermark mask to {:?}", path);
+            Some(mask)
+        })
+        .collect::<Vec<_>>();
 
+    // merge two masks together using another batch mask generator
+    let combiner = batch::mean::Threshold {
+        threshold_factor: 5.,
+    };
     let path = Path::new(&args.output_dir).join("combined_mask.png");
-    log::info!("Saving watermark mask to {:?}", path);
-    batch::average::Threshold {
-        threshold_factor: 2.5,
-    }
-    .mask(
-        &generators
-            .iter()
-            .filter_map(|(_, generator)| generator.mask(&images).ok())
-            .collect::<Vec<_>>(),
-    )?
-    .save(path)?;
+    let mask = combiner.mask(&image_masks)?;
+    mask.save(&path)?;
+    log::info!("Saved watermark mask to {:?}", path);
 
     Ok(())
 }

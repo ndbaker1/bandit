@@ -142,8 +142,9 @@ dependencies = [
  "env_logger",
  "image",
  "inpaint",
+ "itertools 0.14.0",
  "log",
- "ndarray 0.15.6",
+ "ndarray",
  "ndrustfft",
  "rustfft",
 ]
@@ -545,7 +546,7 @@ checksum = "01303804d09bad985130edc8a9034ae3a731865ec1c3d0e7716f60aa3397053c"
 dependencies = [
  "glam",
  "image",
- "ndarray 0.15.6",
+ "ndarray",
  "num-traits",
  "thiserror 2.0.17",
 ]
@@ -572,6 +573,15 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -695,19 +705,6 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.15.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb12d4e967ec485a5f71c6311fe28158e9d6f4bc4a447b474184d0f91a8fa32"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "rawpointer",
-]
-
-[[package]]
-name = "ndarray"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
@@ -728,7 +725,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e9cc4cfdd8779ba7316470317200f796391887fbec0815f9074db4ba75dc1c4"
 dependencies = [
- "ndarray 0.16.1",
+ "ndarray",
  "num-traits",
  "realfft",
  "rustdct",
@@ -996,7 +993,7 @@ dependencies = [
  "built",
  "cfg-if",
  "interpolate_name",
- "itertools",
+ "itertools 0.12.1",
  "libc",
  "libfuzzer-sys",
  "log",

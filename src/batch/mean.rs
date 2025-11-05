@@ -1,7 +1,7 @@
 use image::{GrayImage, Luma};
 use ndarray::Array2;
 
-use crate::MaskGenerator;
+use crate::{MASK_MAX, MASK_MIN, MaskGenerator};
 
 pub struct Threshold {
     pub threshold_factor: f64,
@@ -46,7 +46,11 @@ impl MaskGenerator for Threshold {
         // above or below the threshold value.
         let mask = GrayImage::from_fn(width as _, height as _, |x, y| {
             let pixel = mean_vec[[x as _, y as _]] as u8;
-            let value = if pixel < threshold { 0 } else { u8::MAX };
+            let value = if pixel < threshold {
+                MASK_MIN
+            } else {
+                MASK_MAX
+            };
             Luma([value])
         });
 
