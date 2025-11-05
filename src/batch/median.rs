@@ -1,16 +1,17 @@
 use image::{GrayImage, Luma};
+use itertools::Itertools;
 use ndarray::Array2;
 
 use crate::{MASK_MAX, MASK_MIN, MaskGenerator};
 
 /// constructs an image mask via the following method:
 /// 1. compute a matrix of the mean value per pixel across all images
-/// 1. threshold all pixels by the mean value of the resulting matrix
-pub struct BatchMean {
-    pub mean_threshold_coefficient: f64,
+/// 1. threshold all pixels by the median value of the resulting matrix
+pub struct BatchMedian {
+    pub median_threshold_coefficient: f64,
 }
 
-impl MaskGenerator for BatchMean {
+impl MaskGenerator for BatchMedian {
     fn mask(&self, images: &[GrayImage]) -> crate::error::Result<GrayImage> {
         // take the first image to determine the dimensions of images in the set
         //
@@ -32,12 +33,13 @@ impl MaskGenerator for BatchMean {
 
         log::debug!("Thresholding the Mask");
 
-        // compute the mean using the total number of pixels (also equal to the image area)
-        let mean = mean_mat.mean().ok_or("mean image was empty")?;
-        // apply the threshold coefficient to the mean to get the final value
-        let threshold = (mean * self.mean_threshold_coefficient) as u8;
+        // compute the median over all the pixels in the mean image
+        let candidates: Vec<_> = mean_mat.iter().cloned().sorted_by(f64::total_cmp).collect();
+        let median = candidates[candidates.len() / 2].clone();
+        // apply the threshold coefficient to the median to get the final value
+        let threshold = (median * self.median_threshold_coefficient) as u8;
 
-        log::trace!("mean {}, threshold: {}", mean, threshold);
+        log::trace!("median: {}, threshold: {}", median, threshold);
 
         // compute the mask by determining whether each pixel values in the grayscale image is
         // above or below the threshold value.

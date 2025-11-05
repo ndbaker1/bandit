@@ -8,16 +8,21 @@ use rustfft::{
 
 use crate::{MASK_MAX, MASK_MIN, MaskGenerator};
 
-pub struct FFT2 {
+/// constructs an image mask via the following method:
+/// 1. compute FFT of each image and perform FFT shift
+/// 1. apply a high-pass filter
+/// 1. use the n-th percentile of the magnitude spectrum as a threshold
+/// 1. perform the inverse FFT shift and compute inverse FFT
+pub struct BatchFFT {
     /// the radial factor to use for the high-pass filter on the 2-dimensional FFT image. this
     /// factor is applied to the min of the height and width of the image group.
-    pub high_pass_filter_radial_factor: f64,
+    pub high_pass_filter_radial_coefficient: f64,
 
     /// the percentile factor to use for the spectral filtering
-    pub spectral_filter_percentile_factor: f64,
+    pub spectral_filter_percentile_coefficient: f64,
 }
 
-impl MaskGenerator for FFT2 {
+impl MaskGenerator for BatchFFT {
     fn mask(&self, images: &[GrayImage]) -> crate::error::Result<GrayImage> {
         // take the first image to determine the dimensions of images in the set
         //
@@ -27,7 +32,7 @@ impl MaskGenerator for FFT2 {
 
         // convert all images to their 2d vector representation to make math operations simpler. we
         // also normalize in this step to make all of the operations range from [0,1].
-        let image_vecs: Vec<_> = images
+        let normalized_image_mats: Vec<_> = images
             .iter()
             .map(|image| {
                 Array2::from_shape_fn((width, height), |(x, y)| {
@@ -43,7 +48,7 @@ impl MaskGenerator for FFT2 {
         let fft_forward = planner.plan_fft_forward(width * height);
         let fft_inverse = planner.plan_fft_inverse(width * height);
 
-        let shifted_ffts: Vec<_> = image_vecs
+        let shifted_ffts: Vec<_> = normalized_image_mats
             .iter()
             // convert all pixel values into complex coordinates because the fourier transform
             // operates in the complex plane.
@@ -53,22 +58,16 @@ impl MaskGenerator for FFT2 {
                     .map(|&pix| Complex::new(pix, 0.0))
                     .collect::<Vec<_>>()
             })
-            // perform the forward FFT pass and collect the data in a 2d vector
-            // TODO: why?
             .filter_map(|mut buffer| {
                 fft_forward.process(&mut buffer);
                 Array2::from_shape_vec((width, height), buffer).ok()
             })
-            // perform a shift on the FFT vector
-            // TODO: why?
             .map(|fft| self.fft_shift(&fft))
             .collect();
 
-        log::debug!("Computing the Average Magnitude Spectrum");
+        log::debug!("Computing the Median Magnitude Spectrum");
 
-        // average magnitude spectrum
-        // TODO: why?
-        let magnitude_spectrum_mean = Array2::from_shape_fn((width, height), |(x, y)| {
+        let magnitude_spectrum_median_mat = Array2::from_shape_fn((width, height), |(x, y)| {
             shifted_ffts
                 .iter()
                 .map(|shifted_fft| shifted_fft[[x, y]])
@@ -78,85 +77,91 @@ impl MaskGenerator for FFT2 {
 
         log::debug!("Applying High-Pass filter");
 
-        let magnitude_spectrum_mask = Array2::from_shape_fn((width, height), |(x, y)| {
+        let magnitude_spectrum_mat = Array2::from_shape_fn((width, height), |(x, y)| {
             // compute the low-frequency origin
             let crow = height / 2;
             let ccol = width / 2;
             // compute the radial factor
-            let radius = (height.min(width) as f64 * self.high_pass_filter_radial_factor) as usize;
+            let upper_bound = height.min(width) as f64;
+            let radius = upper_bound * self.high_pass_filter_radial_coefficient;
 
             // mask values inside the low-frequency radial area, and otherwise take the mean
             // magnitude spectrum value.
-            if x.abs_diff(ccol).pow(2) + y.abs_diff(crow).pow(2) < radius.pow(2) {
+            if x.abs_diff(ccol).pow(2) + y.abs_diff(crow).pow(2) < radius.powi(2) as usize {
                 0.0
             } else {
-                magnitude_spectrum_mean[[x, y]]
+                magnitude_spectrum_median_mat[[x, y]]
             }
         });
 
         log::debug!("Thresholding the Filtered Spectrum");
 
-        // find candidates for theshold value based on percentile ranges
-        let magnitude_spectrum_threshold_candidates: Vec<_> = magnitude_spectrum_mask
+        // generate candidates for the theshold value
+        let magnitude_spectrum_threshold_candidates: Vec<_> = magnitude_spectrum_mat
             .iter()
             .filter(|&&x| x > 0.0)
-            .sorted_by(f64_cmp)
+            .cloned()
+            .sorted_by(f64::total_cmp)
             .collect();
-        let magnitude_spectrum_threshold = **magnitude_spectrum_threshold_candidates
-            .get(
-                (self.spectral_filter_percentile_factor
-                    * magnitude_spectrum_threshold_candidates.len() as f64)
-                    as usize,
-            )
-            .expect("spectrum must not be empty");
+
+        // find threshold using the computed percentile range
+        let magnitude_spectrum_threshold = *magnitude_spectrum_threshold_candidates
+            .get({
+                let upper_bound = magnitude_spectrum_threshold_candidates.len() as f64;
+                (self.spectral_filter_percentile_coefficient * upper_bound) as usize
+            })
+            .ok_or("index must not be out of bounds")?;
+
+        let magnitude_spectrum_filter_mask = Array2::from_shape_fn((width, height), |(x, y)| {
+            let magnitude = magnitude_spectrum_mat[[x, y]];
+            let mask = if magnitude > magnitude_spectrum_threshold {
+                0.
+            } else {
+                1.
+            };
+            Complex::new(mask, 0.)
+        });
 
         log::debug!("Generating the Spatial Domain Mask");
 
         let mut spatial_mask_sum = Array2::zeros((width, height));
-        for (i, shifted_fft) in shifted_ffts.iter().enumerate() {
-            let image_filter = Array2::from_shape_fn((width, height), |(x, y)| {
-                let magnitude = magnitude_spectrum_mask[[x, y]];
-                let mask = if magnitude > magnitude_spectrum_threshold {
-                    0.
-                } else {
-                    1.
-                };
-                Complex::new(mask, 0.)
-            });
+        for (shifted_fft, normalized_image_mat) in shifted_ffts.iter().zip(&normalized_image_mats) {
+            let filtered_shifted_fft = shifted_fft * &magnitude_spectrum_filter_mask;
+            let filtered_fft = self.ifft_shift(&filtered_shifted_fft);
 
-            let filtered_s_fft = shifted_fft * image_filter;
-            let filtered_fft_unshifted = self.fft_unshift(&filtered_s_fft);
-
-            let (mut buffer, _) = filtered_fft_unshifted.into_raw_vec_and_offset();
+            let (mut buffer, _) = filtered_fft.into_raw_vec_and_offset();
             fft_inverse.process(&mut buffer);
-            let recon_image = Array2::from_shape_vec((width, height), buffer)?;
+            let normalized_imaged_filtered_mat =
+                Array2::from_shape_vec((width, height), buffer)?.map(|c| c.norm());
 
-            let diff_image = &image_vecs[i] - recon_image.map(|c| c.norm());
-            spatial_mask_sum = spatial_mask_sum + diff_image.abs()
+            // add the absolute diff between the masks to the spatial mask, meaning that we we see
+            // a trend stronger in the filtered image which should be represented in the mask.
+            let diff_mat = normalized_image_mat - normalized_imaged_filtered_mat;
+            spatial_mask_sum = spatial_mask_sum + diff_mat.abs();
         }
 
-        log::debug!("Computing the Average Spatial Mask");
-
-        let spatial_mask_mean = spatial_mask_sum / image_vecs.len() as f64;
+        let spatial_mask_mean = spatial_mask_sum / normalized_image_mats.len() as f64;
 
         log::debug!("Thresholding the Average Spatial Mask");
 
-        let min = *spatial_mask_mean
+        let min = spatial_mask_mean
             .iter()
-            .min_by(f64_cmp)
-            .expect("mask must not be empty");
-        let max = *spatial_mask_mean
+            .cloned()
+            .min_by(f64::total_cmp)
+            .ok_or("mask must not be empty")?;
+        let max = spatial_mask_mean
             .iter()
-            .max_by(f64_cmp)
-            .expect("mask must not be empty");
+            .cloned()
+            .max_by(f64::total_cmp)
+            .ok_or("mask must not be empty")?;
 
-        let mask_vec = (spatial_mask_mean - min) / (max - min);
-        let mask_mean = mask_vec.mean().expect("mask is not empty");
-        let mask_std_dev = mask_vec.std(0.);
+        let mask_mat = (spatial_mask_mean - min) / (max - min);
+        let mask_mean = mask_mat.mean().ok_or("mask must not be empty")?;
+        let mask_std_dev = mask_mat.std(0.);
         let threshold = mask_mean + mask_std_dev;
 
         let mask = GrayImage::from_fn(width as _, height as _, |x, y| {
-            let pixel = mask_vec[[x as _, y as _]];
+            let pixel = mask_mat[[x as _, y as _]];
             let value = if pixel < threshold {
                 MASK_MIN
             } else {
@@ -169,82 +174,51 @@ impl MaskGenerator for FFT2 {
     }
 }
 
-impl FFT2 {
-    // Helper function to perform FFT shift
+impl BatchFFT {
+    /// An fft shift does the following to a one-dimensional signal, and can be extended to any
+    /// number of dimensions:
+    /// * Zero frequency (DC component) moves to the center
+    /// * Negative frequencies appear on the left
+    /// * Positive frequencies appear on the right
+    ///
+    /// this makes it simpler to remove low frequencies and convert back to the original image
+    /// becase the DC component in all dimensions is at the coordinate-space origin.
     fn fft_shift(&self, input: &Array2<Complex<f64>>) -> Array2<Complex<f64>> {
-        let (rows, cols) = input.dim();
-        let mut output = Array2::zeros((rows, cols));
+        // to perform the shift in 2-dimensions, we can order the quadrants in a ring and then
+        // always swap with the quadant that is equal to `+2 mod 4` to get the other side of the
+        // ring.
+        //
+        // ┃Q2┃Q1┃    ┃Q4┃Q3┃
+        // ┣━━╋━━┫ => ┣━━╋━━┫
+        // ┃Q3┃Q4┃    ┃Q1┃Q2┃
+        //
 
-        let crow = rows / 2;
-        let ccol = cols / 2;
+        let (width, height) = input.dim();
+        let (x_mid, y_mid) = (width / 2, height / 2);
 
-        // Quadrant 1 to 4
-        // D C
-        // B A
-        // A -> D, B -> C, C -> B, D -> A
-        // (0,0) to (crow, ccol) -> (crow, ccol) to (rows, cols)
-        // (crow, 0) to (rows, ccol) -> (0, ccol) to (crow, cols)
-        // (0, ccol) to (crow, cols) -> (crow, 0) to (rows, ccol)
-        // (crow, ccol) to (rows, cols) -> (0,0) to (crow, ccol)
+        let q1 = s![x_mid..width, 0..y_mid];
+        let q2 = s![0..x_mid, 0..y_mid];
+        let q3 = s![0..x_mid, y_mid..height];
+        let q4 = s![x_mid..width, y_mid..height];
 
-        // A -> D
-        output
-            .slice_mut(s![0..crow, 0..ccol])
-            .assign(&input.slice(s![crow..rows, ccol..cols]));
-        // B -> C
-        output
-            .slice_mut(s![crow..rows, 0..ccol])
-            .assign(&input.slice(s![0..crow, ccol..cols]));
-        // C -> B
-        output
-            .slice_mut(s![0..crow, ccol..cols])
-            .assign(&input.slice(s![crow..rows, 0..ccol]));
-        // D -> A
-        output
-            .slice_mut(s![crow..rows, ccol..cols])
-            .assign(&input.slice(s![0..crow, 0..ccol]));
+        let mut output = Array2::zeros((width, height));
+
+        output.slice_mut(q1).assign(&input.slice(q3));
+        output.slice_mut(q2).assign(&input.slice(q4));
+        output.slice_mut(q3).assign(&input.slice(q1));
+        output.slice_mut(q4).assign(&input.slice(q2));
 
         output
     }
 
-    // Helper function to perform inverse FFT shift
-    fn fft_unshift(&self, input: &Array2<Complex<f64>>) -> Array2<Complex<f64>> {
-        let (rows, cols) = input.dim();
-        let mut output = Array2::zeros((rows, cols));
-
-        let crow = rows / 2;
-        let ccol = cols / 2;
-
-        // Quadrant 1 to 4
-        // D C
-        // B A
-        // A -> D, B -> C, C -> B, D -> A
-        // (0,0) to (crow, ccol) -> (crow, ccol) to (rows, cols)
-        // (crow, 0) to (rows, ccol) -> (0, ccol) to (crow, cols)
-        // (0, ccol) to (crow, cols) -> (crow, 0) to (rows, ccol)
-        // (crow, ccol) to (rows, cols) -> (0,0) to (crow, ccol)
-
-        // A -> D
-        output
-            .slice_mut(s![crow..rows, ccol..cols])
-            .assign(&input.slice(s![0..crow, 0..ccol]));
-        // B -> C
-        output
-            .slice_mut(s![0..crow, ccol..cols])
-            .assign(&input.slice(s![crow..rows, 0..ccol]));
-        // C -> B
-        output
-            .slice_mut(s![crow..rows, 0..ccol])
-            .assign(&input.slice(s![0..crow, ccol..cols]));
-        // D -> A
-        output
-            .slice_mut(s![0..crow, 0..ccol])
-            .assign(&input.slice(s![crow..rows, ccol..cols]));
-
-        output
+    /// perform the inverse of the fft shift.
+    fn ifft_shift(&self, input: &Array2<Complex<f64>>) -> Array2<Complex<f64>> {
+        // the inverse will be the same operation as fft shift because the space wraps.
+        //
+        // ┃Q4┃Q3┃    ┃Q2┃Q1┃
+        // ┣━━╋━━┫ => ┣━━╋━━┫
+        // ┃Q1┃Q2┃    ┃Q3┃Q4┃
+        //
+        self.fft_shift(input)
     }
-}
-
-fn f64_cmp(a: &&f64, b: &&f64) -> std::cmp::Ordering {
-    a.partial_cmp(b).unwrap()
 }

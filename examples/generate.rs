@@ -53,16 +53,22 @@ fn main() -> Result<()> {
 
     let generators: [(_, &dyn MaskGenerator); _] = [
         (
-            "average",
-            &batch::mean::Threshold {
-                threshold_factor: 1.0,
+            "mean",
+            &batch::mean::BatchMean {
+                mean_threshold_coefficient: 1.0,
+            },
+        ),
+        (
+            "median",
+            &batch::median::BatchMedian {
+                median_threshold_coefficient: 1.0,
             },
         ),
         (
             "frequency",
-            &batch::frequency::FFT2 {
-                high_pass_filter_radial_factor: 0.3,
-                spectral_filter_percentile_factor: 0.6,
+            &batch::frequency::BatchFFT {
+                high_pass_filter_radial_coefficient: 0.3,
+                spectral_filter_percentile_coefficient: 0.6,
             },
         ),
     ];
@@ -80,8 +86,8 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     // merge two masks together using another batch mask generator
-    let combiner = batch::mean::Threshold {
-        threshold_factor: 5.,
+    let combiner = batch::mean::BatchMean {
+        mean_threshold_coefficient: 5.,
     };
     let path = Path::new(&args.output_dir).join("combined_mask.png");
     let mask = combiner.mask(&image_masks)?;
