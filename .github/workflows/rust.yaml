@@ -24,6 +24,8 @@ jobs:
         toolchain: ${{ matrix.rust }}
     - name: Build
       run: cargo build --verbose
+    - name: Build Examples
+      run: cargo build --verbose --examples
     - name: Run tests
       run: cargo test --verbose
     - name: Check formatting

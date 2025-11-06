@@ -1,8 +1,8 @@
-use image::{GrayImage, Luma};
+use image::{DynamicImage, GrayImage, Luma};
 use itertools::Itertools;
 use ndarray::Array2;
 
-use crate::{MASK_MAX, MASK_MIN, MaskGenerator};
+use crate::mask::{MASK_MAX, MASK_MIN, MaskGenerator};
 
 /// constructs an image mask via the following method:
 /// 1. compute a matrix of the median value per pixel across all images
@@ -12,16 +12,21 @@ pub struct BatchMedian {
 }
 
 impl MaskGenerator for BatchMedian {
-    fn mask(&self, images: &[GrayImage]) -> crate::error::Result<GrayImage> {
+    type Container = Vec<u8>;
+    type Pixel = Luma<u8>;
+
+    fn mask(&self, images: &[DynamicImage]) -> crate::error::Result<GrayImage> {
+        let images: Vec<_> = images.iter().map(|image| image.to_luma8()).collect();
+
         // take the first image to determine the dimensions of images in the set
         //
         // SAFETY: dimensions of all images in the list should be identical
         let (width, height) = images.first().ok_or("No images provided")?.dimensions();
         let (width, height) = (width as usize, height as usize);
 
-        log::debug!("Computing the Mean Mask");
+        log::debug!("Computing the Median Mask");
 
-        // computes the mean in pixel dimensions over all images
+        // computes the median in pixel dimensions over all images
         let median_mat = Array2::<f64>::from_shape_fn((width, height), |(x, y)| {
             let median_candidates: Vec<_> = images
                 .iter()
@@ -34,7 +39,7 @@ impl MaskGenerator for BatchMedian {
 
         log::debug!("Thresholding the Mask");
 
-        // compute the median over all the pixels in the mean image
+        // compute the median over all the pixels in the median image
         let candidates: Vec<_> = median_mat
             .iter()
             .cloned()

@@ -1,4 +1,4 @@
-use image::{GrayImage, Luma};
+use image::{DynamicImage, GrayImage, Luma};
 use itertools::Itertools;
 use ndarray::{Array2, s};
 use rustfft::{
@@ -6,7 +6,7 @@ use rustfft::{
     num_complex::{Complex, ComplexFloat},
 };
 
-use crate::{MASK_MAX, MASK_MIN, MaskGenerator};
+use crate::mask::{MASK_MAX, MASK_MIN, MaskGenerator};
 
 /// constructs an image mask via the following method:
 /// 1. compute FFT of each image and perform FFT shift
@@ -23,7 +23,12 @@ pub struct BatchFFT {
 }
 
 impl MaskGenerator for BatchFFT {
-    fn mask(&self, images: &[GrayImage]) -> crate::error::Result<GrayImage> {
+    type Container = Vec<u8>;
+    type Pixel = Luma<u8>;
+
+    fn mask(&self, images: &[DynamicImage]) -> crate::error::Result<GrayImage> {
+        let images: Vec<_> = images.iter().map(|image| image.to_luma8()).collect();
+
         // take the first image to determine the dimensions of images in the set
         //
         // SAFETY: dimensions of all images in the list should be identical
