@@ -1,4 +1,5 @@
 use bandit::{
+    burn::{image_to_tensor, tensor_to_image},
     fill::ml::dip::{self, SkipEncoderDecoder},
     mask::{MASK_MAX, MaskGenerator},
 };
@@ -8,13 +9,9 @@ use burn::{
     backend::{Autodiff, Cuda, cuda::CudaDevice},
     nn::{self, loss::Reduction},
     optim::{GradientsParams, Optimizer},
-    prelude::Backend,
-    tensor::TensorData,
 };
 use clap::Parser;
-use image::{
-    DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, RgbImage, Rgba, RgbaImage,
-};
+use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgba, RgbaImage};
 use std::{
     fmt::Debug,
     fs,
@@ -149,14 +146,16 @@ fn main() -> Result<()> {
             );
 
             // NOTE: detach all tensors that dont require differentiation of loss
-            let image_tensor = image_to_tensor(&image.to_rgb8(), &device).detach();
+            let image_tensor = image_to_tensor(&image, &device).detach();
             // need to invert the mask since white pixels are where the watermark is present
-            let mask_tensor: Tensor<_, _> = 1 - image_to_tensor(&mask.to_rgb8(), &device).detach();
+            let mask_tensor: Tensor<_, _> = 1 - image_to_tensor(&mask, &device).detach();
             let noise =
                 dip::input_noise(input_depth, height as _, width as _, 1., &device).detach();
 
             #[cfg(debug_assertions)]
             {
+                use bandit::burn::tensor_to_image;
+
                 image.save(args.output_dir.join("image_scaled.png"))?;
                 mask.save(args.output_dir.join("mask_scaled.png"))?;
                 tensor_to_image(image_tensor.clone() * mask_tensor.clone())?
@@ -328,55 +327,4 @@ fn derive_rgba_mask(
     }
 
     Ok(w_mask)
-}
-
-fn tensor_to_image<B: Backend>(output: Tensor<B, 4>) -> Result<RgbImage> {
-    let data = output.into_data();
-    let shape = data.shape.clone();
-
-    let (height, width) = (shape[2], shape[3]);
-    let pixels = data
-        .into_vec::<f32>()
-        .map_err(|e| format!("failed to parse data into vec: {:?}", e))?;
-    let num_pixels = (width * height) as usize;
-
-    // Split into channels
-    let r_channel = &pixels[0..num_pixels];
-    let g_channel = &pixels[num_pixels..2 * num_pixels];
-    let b_channel = &pixels[2 * num_pixels..3 * num_pixels];
-
-    let mut rgb_pixels = Vec::with_capacity(num_pixels * 3);
-
-    for i in 0..num_pixels {
-        rgb_pixels.push((r_channel[i].clamp(0.0, 1.0) * 255.0) as u8);
-        rgb_pixels.push((g_channel[i].clamp(0.0, 1.0) * 255.0) as u8);
-        rgb_pixels.push((b_channel[i].clamp(0.0, 1.0) * 255.0) as u8);
-    }
-
-    RgbImage::from_raw(width as u32, height as u32, rgb_pixels)
-        .ok_or("failed to create RgbImage from pixels".into())
-}
-
-fn image_to_tensor<B: Backend>(image: &RgbImage, device: &B::Device) -> Tensor<B, 4> {
-    let (width, height) = image.dimensions();
-
-    // Separate channels
-    let mut r_channel = Vec::with_capacity((width * height) as _);
-    let mut g_channel = Vec::with_capacity((width * height) as _);
-    let mut b_channel = Vec::with_capacity((width * height) as _);
-
-    for pixel in image.pixels() {
-        r_channel.push(pixel.0[0] as f32 / 255.0);
-        g_channel.push(pixel.0[1] as f32 / 255.0);
-        b_channel.push(pixel.0[2] as f32 / 255.0);
-    }
-
-    // Combine channels: [R, G, B]
-    let mut pixels = Vec::with_capacity((width * height * 3) as _);
-    pixels.extend(r_channel);
-    pixels.extend(g_channel);
-    pixels.extend(b_channel);
-
-    let data = TensorData::new(pixels, [1, 3, height as usize, width as usize]);
-    Tensor::from_data(data, device)
 }
