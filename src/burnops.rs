@@ -38,7 +38,7 @@ pub fn tensor_to_image<B: Backend>(output: Tensor<B, 4>) -> crate::error::Result
 
 /// converts a DynamicImage to a burn tensor by first converting it to an RGBA format.
 pub fn image_to_tensor<B: Backend>(image: &DynamicImage, device: &B::Device) -> Tensor<B, 4> {
-    let image = image.to_rgb32f();
+    let image = image.to_rgba32f();
     let (width, height) = image.dimensions();
 
     let mut r_channel = Vec::with_capacity((width * height) as _);

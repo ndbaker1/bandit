@@ -279,17 +279,30 @@ pub fn fit_levels(size: u32, min_size: u32, downsamping_factor: u32) -> u32 {
 }
 
 /// pad dimensions to be divisible by the base to the power of levels
-pub fn pad(size: u32, levels: u32, base: u32) -> u32 {
-    let divisor = base.pow(levels);
+pub fn pad_to_divisor(size: u32, divisor: u32) -> u32 {
     size.div_ceil(divisor) * divisor
 }
 
+pub struct ImagePipelineProperties {
+    pub width: u32,
+    pub width_padding: u32,
+    pub height: u32,
+    pub height_padding: u32,
+    pub levels: u32,
+}
+
 /// Helper to determine optimal architecture for any image size
-pub fn suggest_architecture(image: &DynamicImage) -> (u32, u32, u32) {
+pub fn suggest_image_pipeline(image: &DynamicImage) -> ImagePipelineProperties {
     let (width, height) = image.dimensions();
     let levels = fit_levels(width.min(height), 64, 2);
-    let width = pad(width, levels, 2);
-    let height = pad(height, levels, 2);
+    let padded_width = pad_to_divisor(width, 2u32.pow(levels));
+    let padded_height = pad_to_divisor(height, 2u32.pow(levels));
 
-    (width, height, levels)
+    ImagePipelineProperties {
+        width: padded_width,
+        width_padding: (padded_width - width),
+        height: padded_height,
+        height_padding: (padded_height - height),
+        levels,
+    }
 }

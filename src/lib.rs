@@ -1,6 +1,7 @@
 pub mod fill;
 pub mod mask;
 
-pub mod burn;
+pub mod burnops;
+pub mod imageops;
 
 mod error;
