@@ -1,3 +1,6 @@
 [env]
 RUST_BACKTRACE = "full"
 RUST_LOG = "DEBUG"
+# kernels need to be autotuned otherwise they may overfill the GPU memory and
+# just result in BufferTooBig errors.
+CUBECL_AUTOTUNE_LEVEL="full"
