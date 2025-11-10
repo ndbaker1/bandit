@@ -9,6 +9,7 @@ ndarray = "0.16.1"
 rustfft = "6.4.1"
 log = "0.4"
 itertools = "0.14.0"
+burn = { version = "0.19.1", features = ["autodiff", "cuda"] }
 
 [dev-dependencies]
 env_logger = "0.11"

@@ -19,8 +19,6 @@ impl MaskGenerator for BatchMedian {
         let images: Vec<_> = images.iter().map(|image| image.to_luma8()).collect();
 
         // take the first image to determine the dimensions of images in the set
-        //
-        // SAFETY: dimensions of all images in the list should be identical
         let (width, height) = images.first().ok_or("No images provided")?.dimensions();
         let (width, height) = (width as usize, height as usize);
 

@@ -1,7 +1,22 @@
-use bandit::mask::{MASK_MAX, MaskGenerator};
+use bandit::{
+    fill::ml::dip::{self, SkipEncoderDecoder},
+    mask::{MASK_MAX, MaskGenerator},
+};
+
+use burn::{
+    Tensor,
+    backend::{Autodiff, Cuda, cuda::CudaDevice},
+    nn::{self, loss::Reduction},
+    optim::{GradientsParams, Optimizer},
+    prelude::Backend,
+    tensor::TensorData,
+};
 use clap::Parser;
-use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgba, RgbaImage};
+use image::{
+    DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, RgbImage, Rgba, RgbaImage,
+};
 use std::{
+    fmt::Debug,
     fs,
     path::{Path, PathBuf},
 };
@@ -17,6 +32,12 @@ struct Args {
     /// The path to save the mask
     #[arg(short, long, default_value = ".")]
     output_dir: PathBuf,
+
+    #[arg(short, long, default_value_t = false)]
+    generate: bool,
+
+    #[arg(short, long, default_value = "dip")]
+    mode: String,
 }
 
 fn main() -> Result<()> {
@@ -34,68 +55,156 @@ fn main() -> Result<()> {
 
     log::info!("Found {} image files.", image_files.len());
 
-    let images: Vec<_> = image_files
-        .iter()
-        .filter_map(|img_path| {
-            log::debug!("Processing image: {:?}", img_path);
-            match image::open(img_path) {
-                Ok(image) => Some(image),
-                Err(e) => {
-                    log::error!("Skipping image {:?} due to error: {}", img_path, e);
-                    None
+    let mask_path = args.output_dir.join("final_mask.png");
+    let mask = if args.generate {
+        let images: Vec<_> = image_files
+            .iter()
+            .filter_map(|img_path| {
+                log::debug!("Processing image: {:?}", img_path);
+                match image::open(img_path) {
+                    Ok(image) => Some(image),
+                    Err(e) => {
+                        log::error!("Skipping image {:?} due to error: {}", img_path, e);
+                        None
+                    }
                 }
-            }
-        })
-        .collect();
+            })
+            .collect();
+        let generators: [(_, &dyn MaskGenerator<Container = Vec<u8>, Pixel = Luma<u8>>); _] = [
+            (
+                "mean",
+                &bandit::mask::batch::mean::BatchMean {
+                    mean_threshold_coefficient: 1.0,
+                },
+            ),
+            (
+                "median",
+                &bandit::mask::batch::median::BatchMedian {
+                    median_threshold_coefficient: 1.0,
+                },
+            ),
+            (
+                "frequency",
+                &bandit::mask::batch::frequency::BatchFFT {
+                    high_pass_filter_radial_coefficient: 0.4,
+                    spectral_filter_percentile: 0.95,
+                },
+            ),
+        ];
 
-    let generators: [(_, &dyn MaskGenerator<Container = Vec<u8>, Pixel = Luma<u8>>); _] = [
-        (
-            "mean",
-            &bandit::mask::batch::mean::BatchMean {
-                mean_threshold_coefficient: 1.0,
-            },
-        ),
-        (
-            "median",
-            &bandit::mask::batch::median::BatchMedian {
-                median_threshold_coefficient: 1.0,
-            },
-        ),
-        (
-            "frequency",
-            &bandit::mask::batch::frequency::BatchFFT {
-                high_pass_filter_radial_coefficient: 0.4,
-                spectral_filter_percentile: 0.95,
-            },
-        ),
-    ];
+        // perform all mask generation types and collect their images
+        let image_masks = generators
+            .iter()
+            .filter_map(|(name, generator)| {
+                let mask = generator.mask(&images).ok()?;
+                let path = args.output_dir.join(format!("{}_mask.png", name));
+                mask.save(&path).ok()?;
+                log::info!("Saved mask to {:?}", path);
+                Some(DynamicImage::ImageLuma8(mask))
+            })
+            .collect::<Vec<_>>();
 
-    // perform all mask generation types and collect their images
-    let image_masks = generators
-        .iter()
-        .filter_map(|(name, generator)| {
-            let mask = generator.mask(&images).ok()?;
-            let path = Path::new(&args.output_dir).join(format!("{}_mask.png", name));
-            mask.save(&path).ok()?;
-            log::info!("Saved mask to {:?}", path);
-            Some(DynamicImage::ImageLuma8(mask))
-        })
-        .collect::<Vec<_>>();
+        // merge two masks together using another batch mask generator
+        let combiner = bandit::mask::batch::mean::BatchMean {
+            mean_threshold_coefficient: 3.,
+        };
+        let mask = combiner.mask(&image_masks)?;
+        let mask = strengthen_mask(&mask, 3)?;
+        mask.save(&mask_path)?;
+        log::info!("Saved mask to {:?}", mask_path);
 
-    // merge two masks together using another batch mask generator
-    let combiner = bandit::mask::batch::mean::BatchMean {
-        mean_threshold_coefficient: 3.,
+        mask
+    } else {
+        log::info!("Loading mask from {:?}", mask_path);
+        let mask = image::open(&mask_path)?.to_luma8();
+
+        mask
     };
-    let path = Path::new(&args.output_dir).join("combined_mask.png");
-    let mask = combiner.mask(&image_masks)?;
-    let mask = strengthen_mask(&mask, 3)?;
-    mask.save(&path)?;
-    log::info!("Saved mask to {:?}", path);
 
-    let path = Path::new(&args.output_dir).join("alpha_mask.png");
-    let mask = derive_rgba_mask(&image_files[0], &mask, 5, 0.7)?;
-    mask.save(&path)?;
-    log::info!("Saved mask to {:?}", path);
+    match args.mode.as_str() {
+        "dip" => {
+            let image = image::open(&image_files[0])?;
+            let mask = image::open(&mask_path)?;
+
+            // TODO: generalize resizing and cropping logic
+            let size = 512;
+            let image = image.resize_exact(size, size, image::imageops::FilterType::Nearest);
+            let mask = mask.resize_exact(size, size, image::imageops::FilterType::Nearest);
+
+            let (width_base, height_base) = image.dimensions();
+            let (width, height, levels) = dip::suggest_architecture(&image);
+            let (pad_w, pad_h) = ((width - width_base) / 2, (height - height_base) / 2);
+
+            let device = CudaDevice::default();
+            let input_depth = 32;
+            // TODO: fix memory usage with high channel count
+            let mut model: SkipEncoderDecoder<Autodiff<Cuda>> = SkipEncoderDecoder::new(
+                input_depth,
+                // TODO: optimize dimensions
+                (0..levels).map(|_| 32).collect(),
+                (0..levels).rev().map(|_| 32).collect(),
+                // TODO: fix skip connections
+                (0..levels).map(|_| 0).collect(),
+                &device,
+            );
+
+            // NOTE: detach all tensors that dont require differentiation of loss
+            let image_tensor = image_to_tensor(&image.to_rgb8(), &device).detach();
+            // need to invert the mask since white pixels are where the watermark is present
+            let mask_tensor: Tensor<_, _> = 1 - image_to_tensor(&mask.to_rgb8(), &device).detach();
+            let noise =
+                dip::input_noise(input_depth, height as _, width as _, 1., &device).detach();
+
+            #[cfg(debug_assertions)]
+            {
+                image.save(args.output_dir.join("image_scaled.png"))?;
+                mask.save(args.output_dir.join("mask_scaled.png"))?;
+                tensor_to_image(image_tensor.clone() * mask_tensor.clone())?
+                    .save(args.output_dir.join("applied_mask_scaled.png"))?;
+            }
+
+            // TODO: configurable?
+            let learning_rate = 0.01;
+            let iterations = 3000;
+
+            let mut optimizer = burn::optim::AdamConfig::new().init();
+
+            for i in 0..iterations {
+                let output = model.forward(noise.clone());
+
+                if i % 50 == 0 {
+                    let path = args.output_dir.join(format!("iteration_{:?}.png", i));
+                    log::info!("saving progress to {:?}", path);
+                    tensor_to_image(output.clone())?.save(path)?;
+                }
+
+                let loss = nn::loss::MseLoss::new().forward(
+                    output * mask_tensor.clone(),
+                    image_tensor.clone() * mask_tensor.clone(),
+                    Reduction::Mean,
+                );
+                let gradients = loss.backward();
+                let gradients_params = GradientsParams::from_grads(gradients, &model);
+                model = optimizer.step(learning_rate, model, gradients_params);
+            }
+
+            let output = model.forward(noise);
+            // crop out the original dimensions of the image
+            let output =
+                output.slice([0..1, 0..3, pad_h..(pad_h + height), pad_w..(pad_w + width)]);
+
+            let image = tensor_to_image(output)?;
+            let path = args.output_dir.join("dip.png");
+            image.save(&path)?;
+            log::info!("Saved image to {:?}", path);
+        }
+        _ => {
+            let path = args.output_dir.join("alpha_mask.png");
+            let mask = derive_rgba_mask(&image_files[0], &mask, 10, 0.2)?;
+            mask.save(&path)?;
+            log::info!("Saved mask to {:?}", path);
+        }
+    }
 
     Ok(())
 }
@@ -201,13 +310,13 @@ fn derive_rgba_mask(
 
                 let diff = pixel_estimate - (diff_color / alpha);
 
-                pixel_weighted_mask[channel] -= diff * learning_rate;
+                pixel_weighted_mask[channel] += diff * learning_rate;
             }
 
             // next assume that W(x) is fixed and optimize a(x).
             // NOTE: a known hint is that a(x) is the same for each color channel.
             let alpha_diff_mean = alpha_diff_sum / 3.;
-            pixel_weighted_mask[3] -= alpha_diff_mean * learning_rate;
+            pixel_weighted_mask[3] += alpha_diff_mean * learning_rate;
         }
     }
 
@@ -219,4 +328,55 @@ fn derive_rgba_mask(
     }
 
     Ok(w_mask)
+}
+
+fn tensor_to_image<B: Backend>(output: Tensor<B, 4>) -> Result<RgbImage> {
+    let data = output.into_data();
+    let shape = data.shape.clone();
+
+    let (height, width) = (shape[2], shape[3]);
+    let pixels = data
+        .into_vec::<f32>()
+        .map_err(|e| format!("failed to parse data into vec: {:?}", e))?;
+    let num_pixels = (width * height) as usize;
+
+    // Split into channels
+    let r_channel = &pixels[0..num_pixels];
+    let g_channel = &pixels[num_pixels..2 * num_pixels];
+    let b_channel = &pixels[2 * num_pixels..3 * num_pixels];
+
+    let mut rgb_pixels = Vec::with_capacity(num_pixels * 3);
+
+    for i in 0..num_pixels {
+        rgb_pixels.push((r_channel[i].clamp(0.0, 1.0) * 255.0) as u8);
+        rgb_pixels.push((g_channel[i].clamp(0.0, 1.0) * 255.0) as u8);
+        rgb_pixels.push((b_channel[i].clamp(0.0, 1.0) * 255.0) as u8);
+    }
+
+    RgbImage::from_raw(width as u32, height as u32, rgb_pixels)
+        .ok_or("failed to create RgbImage from pixels".into())
+}
+
+fn image_to_tensor<B: Backend>(image: &RgbImage, device: &B::Device) -> Tensor<B, 4> {
+    let (width, height) = image.dimensions();
+
+    // Separate channels
+    let mut r_channel = Vec::with_capacity((width * height) as _);
+    let mut g_channel = Vec::with_capacity((width * height) as _);
+    let mut b_channel = Vec::with_capacity((width * height) as _);
+
+    for pixel in image.pixels() {
+        r_channel.push(pixel.0[0] as f32 / 255.0);
+        g_channel.push(pixel.0[1] as f32 / 255.0);
+        b_channel.push(pixel.0[2] as f32 / 255.0);
+    }
+
+    // Combine channels: [R, G, B]
+    let mut pixels = Vec::with_capacity((width * height * 3) as _);
+    pixels.extend(r_channel);
+    pixels.extend(g_channel);
+    pixels.extend(b_channel);
+
+    let data = TensorData::new(pixels, [1, 3, height as usize, width as usize]);
+    Tensor::from_data(data, device)
 }
