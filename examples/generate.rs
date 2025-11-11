@@ -155,7 +155,7 @@ fn main() -> Result<()> {
                     (0..levels).map(|_| 32).collect(),
                     (0..levels).rev().map(|_| 32).collect(),
                     // TODO: fix skip connections
-                    (0..levels).map(|_| 0).collect(),
+                    (0..levels).map(|_| 4).collect(),
                     &device,
                 );
 

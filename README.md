@@ -11,6 +11,7 @@ Bandit is a project for learning mask generation and image filling/inpainting
 techniques.
 
 The goal is to implement algorithms ranging from classical heuristics to deep
-neural networks to tackle the task learnning image mask and filling/replacing
-them. This could applied to segmentation, restoration, watermark-removal, or
-other scenarios where a learned image mask could be useful.
+neural networks in an effort to learn image masks and how to fill/replace them.
+This could be applied to segmentation, denoising, restoration,
+watermark-removal, or other scenarios where a learned image mask could be
+useful.
