@@ -1,4 +1,8 @@
-use burn::{Tensor, prelude::Backend, tensor::TensorData};
+use burn::{
+    Tensor,
+    prelude::{Backend, ToElement},
+    tensor::TensorData,
+};
 use image::{DynamicImage, RgbImage};
 
 const RGB_CHANNEL_COUNT: usize = 3;
@@ -13,9 +17,12 @@ pub fn tensor_to_image<B: Backend>(output: Tensor<B, 4>) -> crate::error::Result
     debug_assert_eq!(shape[1], RGB_CHANNEL_COUNT);
 
     let (height, width) = (shape[2], shape[3]);
-    let pixels = data
-        .into_vec::<f32>()
-        .map_err(|e| format!("failed to parse data into vec: {:?}", e))?;
+    let pixels: Vec<_> = data
+        .into_vec::<B::FloatElem>()
+        .map_err(|e| format!("failed to parse data into vec: {:?}", e))?
+        .iter()
+        .map(|a| a.to_f32())
+        .collect();
     let num_pixels = width * height;
 
     // Split into channels

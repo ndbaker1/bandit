@@ -1,7 +1,7 @@
 use bandit::{
     burnops::{image_to_tensor, tensor_to_image},
-    fill::ml::dip::{self, ImagePipelineProperties, SkipEncoderDecoder},
-    imageops::{ProcessingInfo, add_padding},
+    fill::ml::dip::{self, ImagePipelineAttributes, SkipEncoderDecoder},
+    imageops::add_padding,
     mask::{MASK_MAX, MaskGenerator},
 };
 
@@ -13,7 +13,7 @@ use burn::{
     tensor::backend::Backend,
 };
 use clap::Parser;
-use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgba, RgbaImage};
 
 use std::{
     fmt::Debug,
@@ -126,12 +126,13 @@ fn main() -> Result<()> {
             let image = image::open(&image_files[0])?;
             let mask = image::open(&mask_path)?;
 
-            // TODO: promote to a bigger size once stable
-            let image = image.resize(512, 512, image::imageops::FilterType::Nearest);
-            let mask = mask.resize(512, 512, image::imageops::FilterType::Nearest);
+            // TODO: promote to a bigger size once stable. even using the bf16 float type we
+            // encounter BufferTooBig errors on decent single GPU hardware ;(
+            let image = image.resize(700, 700, image::imageops::FilterType::Nearest);
+            let mask = mask.resize(700, 700, image::imageops::FilterType::Nearest);
 
             // Calculate optimal processing dimensions using DIP architecture
-            let ImagePipelineProperties {
+            let ImagePipelineAttributes {
                 width,
                 height,
                 width_padding,
@@ -143,32 +144,25 @@ fn main() -> Result<()> {
             let processed_image = add_padding(&image, width_padding, height_padding);
             let processed_mask = add_padding(&mask, width_padding, height_padding);
 
-            // Create processing info for later restoration
-            let processing_info = ProcessingInfo {
-                original_dims: image.dimensions(),
-                processed_dims: (width, height),
-                // orderd by left, top, right, bottom padding
-                padding: (0, 0, width_padding, height_padding),
-            };
-
             let device = CudaDevice::default();
             // the input depth for the noise
             let depth = 32;
             // TODO: fix memory usage with high channel count
-            let mut model: SkipEncoderDecoder<Autodiff<Cuda>> = SkipEncoderDecoder::new(
-                depth,
-                // TODO: optimize dimensions
-                (0..1).map(|_| 64).collect(),
-                (0..1).rev().map(|_| 64).collect(),
-                // TODO: fix skip connections
-                (0..1).map(|_| 0).collect(),
-                &device,
-            );
+            let mut model: SkipEncoderDecoder<Autodiff<Cuda<burn::tensor::bf16>>> =
+                SkipEncoderDecoder::new(
+                    depth,
+                    // TODO: optimize dimensions
+                    (0..levels).map(|_| 32).collect(),
+                    (0..levels).rev().map(|_| 32).collect(),
+                    // TODO: fix skip connections
+                    (0..levels).map(|_| 0).collect(),
+                    &device,
+                );
 
             // NOTE: detach all tensors that dont require differentiation of loss
             let image_tensor = image_to_tensor(&processed_image, &device).detach();
             // need to invert the mask since white pixels are where the watermark is present
-            let mask_tensor: Tensor<_, _> = 1 - image_to_tensor(&processed_mask, &device).detach();
+            let mask_tensor: Tensor<_, _> = 1. - image_to_tensor(&processed_mask, &device).detach();
 
             let noise = dip::input_noise(depth, height as _, width as _, 1., &device).detach();
 
@@ -184,15 +178,16 @@ fn main() -> Result<()> {
             // TODO: configurable?
             let learning_rate = 0.01;
             let iterations = 3000;
+            let snapshot_step = 50;
 
             let mut optimizer = burn::optim::AdamConfig::new().init();
 
             for i in 0..iterations {
                 let output = model.forward(noise.clone());
 
-                if i % 50 == 0 {
+                if i % snapshot_step == 0 {
                     let path = args.output_dir.join(format!("iteration_{:?}.png", i));
-                    log::info!("saving progress to {:?}", path);
+                    log::info!("saving progress snapshot to {:?}", path);
                     tensor_to_image(output.clone())?.save(path)?;
                 }
 
@@ -201,6 +196,7 @@ fn main() -> Result<()> {
                     image_tensor.clone() * mask_tensor.clone(),
                     Reduction::Mean,
                 );
+
                 let gradients = loss.backward();
                 let gradients_params = GradientsParams::from_grads(gradients, &model);
                 model = optimizer.step(learning_rate, model, gradients_params);
@@ -208,7 +204,12 @@ fn main() -> Result<()> {
 
             let output = model.forward(noise);
             // restore original dimensions instead of simple cropping
-            let output = restore_original_dimensions(output, &processing_info);
+            let output = restore_original_dimensions(
+                output,
+                &ProcessingInfo {
+                    padding: (0, 0, width_padding, height_padding),
+                },
+            );
 
             let image = tensor_to_image(output)?;
             let path = args.output_dir.join("dip.png");
@@ -345,6 +346,12 @@ fn derive_rgba_mask(
     }
 
     Ok(w_mask)
+}
+
+#[derive(Debug, Clone)]
+struct ProcessingInfo {
+    // padding for each side represented as (pad_left, pad_top, pad_right, pad_bottom)
+    pub padding: (u32, u32, u32, u32),
 }
 
 fn restore_original_dimensions<B: Backend>(
