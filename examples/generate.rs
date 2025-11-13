@@ -109,7 +109,7 @@ fn main() -> Result<()> {
             mean_threshold_coefficient: 3.,
         };
         let mask = combiner.mask(&image_masks)?;
-        let mask = strengthen_mask(&mask, 3)?;
+        let mask = flat_structuring_dilation(&mask, 3)?;
         mask.save(&mask_path)?;
         log::info!("Saved mask to {:?}", mask_path);
 
@@ -227,27 +227,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn strengthen_mask(image: &GrayImage, iterations: u32) -> Result<GrayImage> {
+fn flat_structuring_dilation(image: &GrayImage, extension_length: i32) -> Result<GrayImage> {
     let mut image = image.clone();
 
     let (width, height) = image.dimensions();
 
     // iterations of growing strength aroudn borders
-    for _ in 0..iterations {
-        let original = image.clone();
-        for (x, y, pix) in image.enumerate_pixels_mut() {
-            let dx_set = [0, 1, 1, 1, 0, -1, -1, -1];
-            let dy_set = [1, 1, 0, -1, -1, 1, 0, -1];
-            for (&dx, &dy) in dx_set.iter().zip(&dy_set) {
-                let x = x.saturating_add_signed(dx);
-                let y = y.saturating_add_signed(dy);
+    let original = image.clone();
+    for (x, y, Luma([p])) in image.enumerate_pixels_mut() {
+        let mut brightest = (x, y);
+        for x in (-extension_length..=extension_length).map(|d| x.saturating_add_signed(d)) {
+            for y in (-extension_length..=extension_length).map(|d| y.saturating_add_signed(d)) {
                 // stay within bounds
                 if x <= width - 1 && y <= height - 1 && x > 0 && y > 0 {
-                    let delta = (original.get_pixel(x, y)[0] as f64 * 0.3) as u8;
-                    pix[0] = pix[0].saturating_add(delta);
+                    if original.get_pixel(x, y)[0] > *p {
+                        brightest = (x, y);
+                    }
                 }
             }
         }
+        *p = original.get_pixel(brightest.0, brightest.1)[0];
     }
     Ok(image)
 }

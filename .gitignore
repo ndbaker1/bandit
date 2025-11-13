@@ -1,5 +1,12 @@
 *.png
+*.jpg
+*.jpeg
 *.webp
+
+# pytorch
+
+*.pt
+*.pth
 
 # Added by cargo
 
