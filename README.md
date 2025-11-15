@@ -15,3 +15,7 @@ neural networks in an effort to learn image masks and how to fill/replace them.
 This could be applied to segmentation, denoising, restoration,
 watermark-removal, or other scenarios where a learned image mask could be
 useful.
+
+### References
+
+* https://arxiv.org/html/2502.02676v1
